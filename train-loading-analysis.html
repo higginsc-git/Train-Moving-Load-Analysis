@@ -1,0 +1,1681 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bridge Train Loading Analysis (Cooper E-XX & AREMA Alternate)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .num { font-variant-numeric: tabular-nums; }
+  .axis-text { font-size: 11px; fill: #4b5563; }
+  .axis-title { font-size: 12px; fill: #1f2937; font-weight: 600; }
+  .grid-line { stroke: #e5e7eb; stroke-width: 1; stroke-dasharray: 2,2; }
+  .axis-line { stroke: #6b7280; stroke-width: 1.2; }
+  .struct-line { stroke: #1f2937; stroke-width: 2.5; fill: none; }
+  .support-tri { fill: #4b5563; }
+  .hatch { stroke: #475569; stroke-width: 1; }
+  table.results { font-variant-numeric: tabular-nums; }
+  table.results th, table.results td { padding: 6px 10px; }
+  .tab-active { background: #1f2937; color: white; }
+  .tab-inactive { background: #f1f5f9; color: #334155; }
+  .tab-inactive:hover { background: #e2e8f0; }
+  details > summary { cursor: pointer; user-select: none; }
+  details > summary::marker { color: #64748b; }
+</style>
+</head>
+<body class="bg-slate-50 min-h-screen">
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useMemo, useCallback, useRef } = React;
+
+/* ============================================================
+   COOPER E-80 AXLE PATTERN (per AREMA Chapter 15)
+   All loads scale linearly with E-rating: load = baseLoad * (E/80)
+   Spacings are independent of E-rating.
+   ============================================================ */
+
+const COOPER_DRIVER_LOADS    = [40, 80, 80, 80, 80];   // pilot + 4 drivers (kips at E-80)
+const COOPER_DRIVER_SPACING  = [8, 5, 5, 5];            // ft
+const COOPER_TENDER_LOADS    = [52, 52, 52, 52];       // 4 tender axles (kips at E-80)
+const COOPER_TENDER_SPACING  = [5, 6, 5];               // ft
+const DRIVER_TO_TENDER_GAP   = 9;                       // ft, last driver to first tender
+const TENDER_TO_NEXT_LOCO    = 8;                       // ft, last tender to next pilot
+const TENDER_TO_UNIFORM      = 5;                       // ft, last tender to uniform start
+const COOPER_UNIFORM         = 8;                       // k/ft (E-80)
+
+// AREMA Alternate Live Load: four 100-kip axles, spacings 5', 6', 5'
+const ALT_LOADS    = [100, 100, 100, 100];
+const ALT_SPACING  = [5, 6, 5];
+
+/* ============================================================
+   CONSIST GENERATION
+   Position = offset (ft) from lead axle, measured backward into the consist.
+   ============================================================ */
+
+function generateCooperConsist(eRating, numLoco) {
+  const scale = eRating / 80;
+  const positions = [];
+  const loads = [];
+  let x = 0;
+  for (let loco = 0; loco < numLoco; loco++) {
+    for (let i = 0; i < COOPER_DRIVER_LOADS.length; i++) {
+      positions.push(x);
+      loads.push(+(COOPER_DRIVER_LOADS[i] * scale).toFixed(3));
+      if (i < COOPER_DRIVER_LOADS.length - 1) x += COOPER_DRIVER_SPACING[i];
+    }
+    x += DRIVER_TO_TENDER_GAP;
+    for (let i = 0; i < COOPER_TENDER_LOADS.length; i++) {
+      positions.push(x);
+      loads.push(+(COOPER_TENDER_LOADS[i] * scale).toFixed(3));
+      if (i < COOPER_TENDER_LOADS.length - 1) x += COOPER_TENDER_SPACING[i];
+    }
+    if (loco < numLoco - 1) x += TENDER_TO_NEXT_LOCO;
+  }
+  return {
+    name: `Cooper E-${eRating} (${numLoco} loco)`,
+    short: `E-${eRating}`,
+    positions,
+    loads,
+    uniformOffset: x + TENDER_TO_UNIFORM,
+    uniformLoad: +(COOPER_UNIFORM * scale).toFixed(4),
+    consistLength: x
+  };
+}
+
+function generateAlternateConsist() {
+  const positions = [];
+  let x = 0;
+  for (let i = 0; i < ALT_LOADS.length; i++) {
+    positions.push(x);
+    if (i < ALT_LOADS.length - 1) x += ALT_SPACING[i];
+  }
+  return {
+    name: 'AREMA Alternate Live Load',
+    short: 'Alt',
+    positions,
+    loads: [...ALT_LOADS],
+    uniformOffset: null,
+    uniformLoad: 0,
+    consistLength: x
+  };
+}
+
+/* ============================================================
+   ANALYSIS ENGINE
+   Coordinate system: x = 0 at left support, x = L at right support.
+   Left cantilever spans x in [-Cl, 0], right cantilever in [L, L+Cr].
+   Sign convention: positive M = sagging, positive V = upward force on left side of cut.
+   ============================================================ */
+
+// Place consist with lead axle at xLead, moving in given direction.
+// direction = +1: trailing axles to LEFT of lead, uniform tail extends to LEFT.
+// direction = -1: trailing axles to RIGHT of lead, uniform tail extends to RIGHT.
+function placeConsist(consist, xLead, direction) {
+  const positions = consist.positions.map(off => xLead - direction * off);
+  const loads = [...consist.loads];
+  let uniform = null;
+  if (consist.uniformOffset !== null && consist.uniformLoad > 0) {
+    if (direction > 0) {
+      uniform = { end: xLead - direction * consist.uniformOffset, start: -1e9, w: consist.uniformLoad };
+    } else {
+      uniform = { start: xLead - direction * consist.uniformOffset, end: 1e9, w: consist.uniformLoad };
+    }
+  }
+  return { positions, loads, uniform };
+}
+
+function clipUniform(uniform, leftCant, L, rightCant) {
+  if (!uniform) return null;
+  const start = Math.max(uniform.start, -leftCant);
+  const end = Math.min(uniform.end, L + rightCant);
+  if (end <= start + 1e-9) return null;
+  return { start, end, w: uniform.w };
+}
+
+function placeAndClip(consist, xLead, direction, leftCant, L, rightCant) {
+  const placed = placeConsist(consist, xLead, direction);
+  const sLeft = -leftCant, sRight = L + rightCant;
+  // Drop axles that are off the structure entirely so they don't contribute
+  // spurious reactions or section forces.
+  const positions = [];
+  const loads = [];
+  for (let i = 0; i < placed.positions.length; i++) {
+    const p = placed.positions[i];
+    if (p >= sLeft - 1e-9 && p <= sRight + 1e-9) {
+      positions.push(p);
+      loads.push(placed.loads[i]);
+    }
+  }
+  return {
+    positions,
+    loads,
+    uniform: clipUniform(placed.uniform, leftCant, L, rightCant)
+  };
+}
+
+function computeReactions(loadCase, L) {
+  let totalLoad = 0, totalMoment = 0;
+  for (let i = 0; i < loadCase.positions.length; i++) {
+    const p = loadCase.positions[i];
+    totalLoad += loadCase.loads[i];
+    totalMoment += loadCase.loads[i] * p;
+  }
+  if (loadCase.uniform) {
+    const u = loadCase.uniform;
+    const len = u.end - u.start;
+    if (len > 0) {
+      const c = (u.start + u.end) / 2;
+      totalLoad += u.w * len;
+      totalMoment += u.w * len * c;
+    }
+  }
+  const RB = totalMoment / L;
+  const RA = totalLoad - RB;
+  return { RA, RB };
+}
+
+function computeMoment(x, loadCase, L) {
+  let M = 0;
+  const { RA, RB } = computeReactions(loadCase, L);
+  if (0 < x) M += RA * x;
+  if (L < x) M += RB * (x - L);
+  for (let i = 0; i < loadCase.positions.length; i++) {
+    const p = loadCase.positions[i];
+    if (p < x) M -= loadCase.loads[i] * (x - p);
+  }
+  if (loadCase.uniform) {
+    const u = loadCase.uniform;
+    const a = u.start;
+    const b = Math.min(u.end, x);
+    if (b > a) {
+      const len = b - a;
+      const c = (a + b) / 2;
+      M -= u.w * len * (x - c);
+    }
+  }
+  return M;
+}
+
+function computeShear(x, loadCase, L, side) {
+  const eps = 1e-9;
+  const xCut = side === 'left' ? x - eps : x + eps;
+  let V = 0;
+  const { RA, RB } = computeReactions(loadCase, L);
+  if (0 < xCut) V += RA;
+  if (L < xCut) V += RB;
+  for (let i = 0; i < loadCase.positions.length; i++) {
+    if (loadCase.positions[i] < xCut) V -= loadCase.loads[i];
+  }
+  if (loadCase.uniform) {
+    const u = loadCase.uniform;
+    const a = u.start;
+    const b = Math.min(u.end, xCut);
+    if (b > a) V -= u.w * (b - a);
+  }
+  return V;
+}
+
+// Vectorized helpers (parallel naming to existing tools)
+function computeSpanMoments(loadCase, sections, L) {
+  return sections.map(x => computeMoment(x, loadCase, L));
+}
+function computeShears(loadCase, sections, L) {
+  return sections.map(x => ({
+    left: computeShear(x, loadCase, L, 'left'),
+    right: computeShear(x, loadCase, L, 'right')
+  }));
+}
+function computeInteriorMV(loadCase, sections, L) {
+  return { M: computeSpanMoments(loadCase, sections, L), V: computeShears(loadCase, sections, L) };
+}
+function invertSigns(arr) { return arr.map(v => -v); }
+
+/* Moving Load Envelope: step lead axle position across structure for both directions */
+function movingLoadEnvelope(consist, leftCant, L, rightCant, sections, step) {
+  const N = sections.length;
+  const Mmax = new Array(N).fill(-Infinity);
+  const Mmin = new Array(N).fill(Infinity);
+  const Vmax = new Array(N).fill(-Infinity);
+  const Vmin = new Array(N).fill(Infinity);
+  const MmaxXLead = new Array(N).fill(0);
+  const MminXLead = new Array(N).fill(0);
+  const VmaxXLead = new Array(N).fill(0);
+  const VminXLead = new Array(N).fill(0);
+  const MmaxDir = new Array(N).fill(1);
+  const MminDir = new Array(N).fill(1);
+  const VmaxDir = new Array(N).fill(1);
+  const VminDir = new Array(N).fill(1);
+
+  const cLen = consist.consistLength;
+  const uOff = consist.uniformOffset !== null ? consist.uniformOffset : cLen;
+  const maxOff = Math.max(cLen, uOff);
+
+  for (const direction of [+1, -1]) {
+    let xMin, xMax;
+    if (direction > 0) {
+      xMin = -leftCant - 0.5;
+      xMax = L + rightCant + maxOff + 0.5;
+    } else {
+      xMin = -leftCant - maxOff - 0.5;
+      xMax = L + rightCant + 0.5;
+    }
+    for (let xLead = xMin; xLead <= xMax + 1e-9; xLead += step) {
+      const lc = placeAndClip(consist, xLead, direction, leftCant, L, rightCant);
+      let hasLoad = lc.uniform !== null;
+      if (!hasLoad) {
+        for (let i = 0; i < lc.positions.length; i++) {
+          if (lc.positions[i] >= -leftCant - 1e-6 && lc.positions[i] <= L + rightCant + 1e-6) {
+            hasLoad = true; break;
+          }
+        }
+      }
+      if (!hasLoad) continue;
+
+      for (let s = 0; s < N; s++) {
+        const x = sections[s];
+        const M = computeMoment(x, lc, L);
+        const VL = computeShear(x, lc, L, 'left');
+        const VR = computeShear(x, lc, L, 'right');
+        if (M > Mmax[s]) { Mmax[s] = M; MmaxXLead[s] = xLead; MmaxDir[s] = direction; }
+        if (M < Mmin[s]) { Mmin[s] = M; MminXLead[s] = xLead; MminDir[s] = direction; }
+        const Vhi = Math.max(VL, VR);
+        const Vlo = Math.min(VL, VR);
+        if (Vhi > Vmax[s]) { Vmax[s] = Vhi; VmaxXLead[s] = xLead; VmaxDir[s] = direction; }
+        if (Vlo < Vmin[s]) { Vmin[s] = Vlo; VminXLead[s] = xLead; VminDir[s] = direction; }
+      }
+    }
+  }
+  return { Mmax, Mmin, Vmax, Vmin, MmaxXLead, MminXLead, VmaxXLead, VminXLead,
+           MmaxDir, MminDir, VmaxDir, VminDir };
+}
+
+/* Influence-line ordinates for unit load at p */
+function ILMomentAt(x, p, L) {
+  let M = 0;
+  const RA = (L - p) / L, RB = p / L;
+  if (0 < x) M += RA * x;
+  if (L < x) M += RB * (x - L);
+  if (p < x) M -= 1 * (x - p);
+  return M;
+}
+function ILShearAt(x, p, L, side) {
+  const eps = 1e-9;
+  const xCut = side === 'left' ? x - eps : x + eps;
+  let V = 0;
+  const RA = (L - p) / L, RB = p / L;
+  if (0 < xCut) V += RA;
+  if (L < xCut) V += RB;
+  if (p < xCut) V -= 1;
+  return V;
+}
+
+function computeILSamples(x, L, leftCant, rightCant, type, side, numPoints = 240) {
+  const xMin = -leftCant, xMax = L + rightCant;
+  const step = (xMax - xMin) / numPoints;
+  const samples = [];
+  for (let i = 0; i <= numPoints; i++) {
+    const p = xMin + i * step;
+    const val = type === 'M' ? ILMomentAt(x, p, L) : ILShearAt(x, p, L, side);
+    samples.push({ p, val });
+  }
+  // Insert points immediately on either side of x for shear (visualize the unit jump)
+  if (type === 'V') {
+    const eps = 0.0005;
+    if (x - eps >= xMin && x - eps <= xMax) samples.push({ p: x - eps, val: ILShearAt(x, x - eps, L, side) });
+    if (x + eps >= xMin && x + eps <= xMax) samples.push({ p: x + eps, val: ILShearAt(x, x + eps, L, side) });
+    samples.sort((a, b) => a.p - b.p);
+  }
+  return samples;
+}
+
+/* Trapezoidal IL integration with zero-crossing detection */
+function trapIntegrate(f, a, b, nSteps = 200) {
+  if (b <= a) return 0;
+  const h = (b - a) / nSteps;
+  let sum = 0;
+  let prevX = a, prevF = f(a);
+  for (let i = 1; i <= nSteps; i++) {
+    const xi = a + i * h;
+    const fi = f(xi);
+    if (prevF * fi < 0) {
+      const xz = prevX - prevF * (xi - prevX) / (fi - prevF);
+      sum += 0.5 * (xz - prevX) * prevF;
+      sum += 0.5 * (xi - xz) * fi;
+    } else {
+      sum += 0.5 * (xi - prevX) * (prevF + fi);
+    }
+    prevX = xi; prevF = fi;
+  }
+  return sum;
+}
+
+/* Apply consist via IL summation/integration; returns response at section x */
+function applyConsistByIL(consist, xLead, direction, x, L, leftCant, rightCant, type, side) {
+  const ilFn = type === 'M'
+    ? (p) => ILMomentAt(x, p, L)
+    : (p) => ILShearAt(x, p, L, side);
+  let R = 0;
+  for (let i = 0; i < consist.positions.length; i++) {
+    const p = xLead - direction * consist.positions[i];
+    if (p >= -leftCant && p <= L + rightCant) R += consist.loads[i] * ilFn(p);
+  }
+  if (consist.uniformOffset !== null && consist.uniformLoad > 0) {
+    let uS, uE;
+    if (direction > 0) { uE = xLead - direction * consist.uniformOffset; uS = -leftCant; }
+    else { uS = xLead - direction * consist.uniformOffset; uE = L + rightCant; }
+    uS = Math.max(uS, -leftCant);
+    uE = Math.min(uE, L + rightCant);
+    if (uE > uS) R += consist.uniformLoad * trapIntegrate(ilFn, uS, uE, 200);
+  }
+  return R;
+}
+
+/* Optimal placement for max +/- response at a single section */
+function findOptimalPlacement(consist, x, L, leftCant, rightCant, type, side, step) {
+  const cLen = consist.consistLength;
+  const uOff = consist.uniformOffset !== null ? consist.uniformOffset : cLen;
+  const maxOff = Math.max(cLen, uOff);
+  let bestPos = { val: -Infinity, xLead: 0, direction: 1 };
+  let bestNeg = { val: Infinity, xLead: 0, direction: 1 };
+  for (const direction of [+1, -1]) {
+    let xMin, xMax;
+    if (direction > 0) { xMin = -leftCant - 0.5; xMax = L + rightCant + maxOff + 0.5; }
+    else { xMin = -leftCant - maxOff - 0.5; xMax = L + rightCant + 0.5; }
+    for (let xLead = xMin; xLead <= xMax + 1e-9; xLead += step) {
+      const R = applyConsistByIL(consist, xLead, direction, x, L, leftCant, rightCant, type, side);
+      if (R > bestPos.val) bestPos = { val: R, xLead, direction };
+      if (R < bestNeg.val) bestNeg = { val: R, xLead, direction };
+    }
+  }
+  return { positive: bestPos, negative: bestNeg };
+}
+
+/* Dead load envelope: uniform DL over the full structure, no movement, no impact.
+   Returns moment and shear (both sides) at every section. */
+function deadLoadEnvelope(wDL, leftCant, L, rightCant, sections) {
+  const N = sections.length;
+  if (!wDL || wDL <= 0) {
+    return {
+      M: new Array(N).fill(0),
+      Vleft: new Array(N).fill(0),
+      Vright: new Array(N).fill(0)
+    };
+  }
+  const loadCase = {
+    positions: [],
+    loads: [],
+    uniform: { start: -leftCant, end: L + rightCant, w: wDL }
+  };
+  return {
+    M: sections.map(x => computeMoment(x, loadCase, L)),
+    Vleft: sections.map(x => computeShear(x, loadCase, L, 'left')),
+    Vright: sections.map(x => computeShear(x, loadCase, L, 'right'))
+  };
+}
+
+/* Combine envelopes from multiple consists (design envelope) */
+function designEnvelope(consists, leftCant, L, rightCant, sections, step) {
+  const perConsist = [];
+  let combined = null;
+  for (const consist of consists) {
+    const env = movingLoadEnvelope(consist, leftCant, L, rightCant, sections, step);
+    perConsist.push({ consist, env });
+    if (combined === null) {
+      combined = {
+        Mmax: [...env.Mmax], Mmin: [...env.Mmin],
+        Vmax: [...env.Vmax], Vmin: [...env.Vmin],
+        MmaxSrc: env.Mmax.map(() => consist.short),
+        MminSrc: env.Mmin.map(() => consist.short),
+        VmaxSrc: env.Vmax.map(() => consist.short),
+        VminSrc: env.Vmin.map(() => consist.short)
+      };
+    } else {
+      for (let s = 0; s < sections.length; s++) {
+        if (env.Mmax[s] > combined.Mmax[s]) { combined.Mmax[s] = env.Mmax[s]; combined.MmaxSrc[s] = consist.short; }
+        if (env.Mmin[s] < combined.Mmin[s]) { combined.Mmin[s] = env.Mmin[s]; combined.MminSrc[s] = consist.short; }
+        if (env.Vmax[s] > combined.Vmax[s]) { combined.Vmax[s] = env.Vmax[s]; combined.VmaxSrc[s] = consist.short; }
+        if (env.Vmin[s] < combined.Vmin[s]) { combined.Vmin[s] = env.Vmin[s]; combined.VminSrc[s] = consist.short; }
+      }
+    }
+  }
+  return { combined, perConsist };
+}
+
+/* ============================================================
+   UI HELPERS
+   ============================================================ */
+
+function fmt(n, dp = 1) {
+  if (!isFinite(n)) return '--';
+  return n.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
+}
+
+function NumInput({ label, value, onChange, suffix, step = 1, min, max, hint }) {
+  return (
+    <div className="flex flex-col">
+      <label className="text-xs font-semibold text-slate-700 mb-1 uppercase tracking-wide">{label}</label>
+      <div className="flex items-center">
+        <input
+          type="number"
+          className="num w-full px-2 py-1.5 border border-slate-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm"
+          value={value}
+          onChange={e => onChange(parseFloat(e.target.value))}
+          step={step} min={min} max={max}
+        />
+        {suffix && <span className="ml-2 text-sm text-slate-500">{suffix}</span>}
+      </div>
+      {hint && <span className="text-xs text-slate-400 mt-0.5">{hint}</span>}
+    </div>
+  );
+}
+
+function SelectInput({ label, value, onChange, options }) {
+  return (
+    <div className="flex flex-col">
+      <label className="text-xs font-semibold text-slate-700 mb-1 uppercase tracking-wide">{label}</label>
+      <select
+        className="w-full px-2 py-1.5 border border-slate-300 rounded-md focus:ring-2 focus:ring-blue-500 text-sm bg-white"
+        value={value}
+        onChange={e => onChange(e.target.value)}
+      >
+        {options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+      </select>
+    </div>
+  );
+}
+
+/* ============================================================
+   TRAIN LOADING DIAGRAM (axle pattern as a key/legend)
+   Drawn left-to-right with lead axle on the LEFT, uniform tail to the RIGHT,
+   matching how the train is drawn on the structure when the lead axle moves left to right.
+   ============================================================ */
+function TrainLoadingDiagram({ consist, title }) {
+  const W = 880, H = 170;
+  const margin = { l: 40, r: 40, t: 38, b: 56 };
+  const yBase = H - margin.b;
+
+  const totalSpan = consist.uniformOffset !== null ? consist.uniformOffset + 28 : consist.consistLength + 10;
+  // Lead axle (offset 0) on the LEFT; offsets grow to the RIGHT.
+  const drawX = off => margin.l + (off / totalSpan) * (W - margin.l - margin.r);
+
+  const wMax = Math.max(...consist.loads);
+  const triH = 30;
+  const triHfor = w => triH * (0.55 + 0.45 * (w / wMax));
+
+  const positions = consist.positions;
+  const isCooper = consist.name.startsWith('Cooper');
+  const axleGroupSize = COOPER_DRIVER_LOADS.length + COOPER_TENDER_LOADS.length;
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: '210px' }}>
+      <text x={margin.l} y={18} className="axis-title">{title}</text>
+      <text x={margin.l} y={32} fontSize="10" fill="#64748b">
+        Lead axle on left; train travels right to left as drawn (axles enter the bridge from the right).
+      </text>
+
+      {/* Rail line */}
+      <line x1={margin.l - 10} y1={yBase} x2={W - margin.r + 10} y2={yBase} className="struct-line" />
+
+      {/* Uniform tail (drawn to the RIGHT of last axle) */}
+      {consist.uniformOffset !== null && (
+        <g>
+          <rect
+            x={drawX(consist.uniformOffset)} y={yBase - 18}
+            width={drawX(totalSpan - 3) - drawX(consist.uniformOffset)} height={18}
+            fill="#dbeafe" stroke="#1d4ed8" strokeWidth="1"
+          />
+          <text x={(drawX(consist.uniformOffset) + drawX(totalSpan - 3)) / 2}
+            y={yBase - 24} textAnchor="middle" fontSize="11" fontWeight="600" fill="#1e40af">
+            {consist.uniformLoad.toFixed(2)} k/ft uniform tail
+          </text>
+        </g>
+      )}
+
+      {/* Axle arrows + load labels */}
+      {positions.map((off, i) => {
+        const px = drawX(off);
+        const load = consist.loads[i];
+        const tH = triHfor(load);
+        let fill = '#0891b2'; // default
+        if (isCooper) {
+          const grp = i % axleGroupSize;
+          if (grp === 0) fill = '#1e293b';            // pilot
+          else if (grp < COOPER_DRIVER_LOADS.length) fill = '#1e40af'; // driver
+          else fill = '#0891b2';                       // tender
+        }
+        return (
+          <g key={i}>
+            <polygon
+              points={`${px},${yBase} ${px - 5},${yBase - tH} ${px + 5},${yBase - tH}`}
+              fill={fill} stroke="#1e293b" strokeWidth="0.5"
+            />
+            <line x1={px} y1={yBase} x2={px} y2={yBase + 5} stroke="#1e293b" strokeWidth="1" />
+            <text x={px} y={yBase - tH - 3} textAnchor="middle" fontSize="9" fontWeight="600" fill="#1e293b">
+              {load.toFixed(0)}
+            </text>
+          </g>
+        );
+      })}
+
+      {/* Spacing labels */}
+      {positions.slice(1).map((off, i) => {
+        const prev = positions[i];
+        const space = off - prev;
+        const xMid = (drawX(off) + drawX(prev)) / 2;
+        return (
+          <text key={`s${i}`} x={xMid} y={yBase + 14} textAnchor="middle" fontSize="9" fill="#475569">
+            {space}'
+          </text>
+        );
+      })}
+
+      {/* Gap to uniform */}
+      {consist.uniformOffset !== null && (
+        <text
+          x={(drawX(consist.uniformOffset) + drawX(positions[positions.length - 1])) / 2}
+          y={yBase + 14} textAnchor="middle" fontSize="9" fontWeight="600" fill="#1d4ed8"
+        >
+          {(consist.uniformOffset - positions[positions.length - 1]).toFixed(0)}'
+        </text>
+      )}
+
+      {/* Lead axle label */}
+      <text x={drawX(0)} y={yBase + 30} textAnchor="middle" fontSize="10" fontWeight="600" fill="#1e40af">
+        lead axle
+      </text>
+      {/* Direction arrow (points left, matching lead-on-left = travel right-to-left) */}
+      <g transform={`translate(${margin.l + 24}, ${yBase + 42})`}>
+        <line x1={50} y1={0} x2={0} y2={0} stroke="#1e40af" strokeWidth="1.5" />
+        <polygon points={`0,0 6,-3 6,3`} fill="#1e40af" />
+        <text x={26} y={-3} textAnchor="middle" fontSize="9" fill="#1e40af">travel</text>
+      </g>
+
+      {/* Legend (Cooper only) */}
+      {isCooper && (
+        <g transform={`translate(${W - margin.r - 230}, ${yBase + 28})`}>
+          <rect x={0} y={0} width={222} height={18} fill="white" stroke="#cbd5e1" rx={3} />
+          <polygon points="6,14 11,5 16,14" fill="#1e293b" />
+          <text x={20} y={13} fontSize="10" fill="#1e293b">pilot</text>
+          <polygon points="56,14 61,5 66,14" fill="#1e40af" />
+          <text x={70} y={13} fontSize="10" fill="#1e293b">driver</text>
+          <polygon points="116,14 121,5 126,14" fill="#0891b2" />
+          <text x={130} y={13} fontSize="10" fill="#1e293b">tender</text>
+          <rect x={170} y={6} width={10} height={8} fill="#dbeafe" stroke="#1d4ed8" />
+          <text x={184} y={13} fontSize="10" fill="#1e293b">uniform</text>
+        </g>
+      )}
+    </svg>
+  );
+}
+
+/* ============================================================
+   BEAM WITH TRAIN DIAGRAM
+   Shows the structure with a train loading placed at a specific lead-axle
+   position and direction. Used in the Influence Line tab to visualize
+   the optimal placement.
+   ============================================================ */
+function BeamWithTrain({ consist, xLead, direction, leftCant, L, rightCant, sectionMark, label }) {
+  const W = 880, H = 170;
+  const margin = { l: 50, r: 30, t: 36, b: 38 };
+  const total = leftCant + L + rightCant;
+  const xToPx = x => margin.l + ((x + leftCant) / total) * (W - margin.l - margin.r);
+  const yBeam = H - margin.b;
+
+  // Compute axle positions on structure
+  const placedAxles = consist.positions.map((off, i) => ({
+    p: xLead - direction * off,
+    load: consist.loads[i],
+    idx: i
+  })).filter(a => a.p >= -leftCant - 1e-6 && a.p <= L + rightCant + 1e-6);
+
+  // Compute uniform extent on structure
+  let uniform = null;
+  if (consist.uniformOffset !== null && consist.uniformLoad > 0) {
+    let uS, uE;
+    if (direction > 0) { uE = xLead - direction * consist.uniformOffset; uS = -leftCant; }
+    else { uS = xLead - direction * consist.uniformOffset; uE = L + rightCant; }
+    uS = Math.max(uS, -leftCant);
+    uE = Math.min(uE, L + rightCant);
+    if (uE > uS) uniform = { start: uS, end: uE, w: consist.uniformLoad };
+  }
+
+  const wMax = consist.loads.length ? Math.max(...consist.loads) : 1;
+  const triH = 30;
+  const triHfor = w => triH * (0.55 + 0.45 * (w / wMax));
+  const isCooper = consist.name.startsWith('Cooper');
+  const axleGroupSize = COOPER_DRIVER_LOADS.length + COOPER_TENDER_LOADS.length;
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: '210px' }}>
+      {label && <text x={margin.l} y={18} className="axis-title">{label}</text>}
+      <text x={margin.l} y={32} fontSize="10" fill="#64748b">
+        Lead axle at x = {fmt(xLead, 2)} ft, lead axle moving {direction > 0 ? 'left to right' : 'right to left'}.
+      </text>
+
+      {/* Uniform load (above beam) */}
+      {uniform && (
+        <g>
+          <rect x={xToPx(uniform.start)} y={yBeam - 16}
+            width={xToPx(uniform.end) - xToPx(uniform.start)} height={14}
+            fill="#dbeafe" stroke="#1d4ed8" strokeWidth="1" />
+          <text x={(xToPx(uniform.start) + xToPx(uniform.end)) / 2} y={yBeam - 20}
+            textAnchor="middle" fontSize="10" fill="#1e40af" fontWeight="600">
+            {uniform.w.toFixed(2)} k/ft
+          </text>
+        </g>
+      )}
+
+      {/* Axle arrows */}
+      {placedAxles.map((a) => {
+        const px = xToPx(a.p);
+        const tH = triHfor(a.load);
+        let fill = '#0891b2';
+        if (isCooper) {
+          const grp = a.idx % axleGroupSize;
+          if (grp === 0) fill = '#1e293b';
+          else if (grp < COOPER_DRIVER_LOADS.length) fill = '#1e40af';
+          else fill = '#0891b2';
+        }
+        return (
+          <g key={a.idx}>
+            <line x1={px} y1={yBeam - tH} x2={px} y2={yBeam} stroke={fill} strokeWidth="1.5" />
+            <polygon
+              points={`${px},${yBeam} ${px - 4},${yBeam - 6} ${px + 4},${yBeam - 6}`}
+              fill={fill} stroke={fill} strokeWidth="0.5"
+            />
+            <text x={px} y={yBeam - tH - 3} textAnchor="middle" fontSize="9" fontWeight="600" fill="#1e293b">
+              {a.load.toFixed(0)}
+            </text>
+          </g>
+        );
+      })}
+
+      {/* Beam */}
+      <line x1={xToPx(-leftCant)} y1={yBeam} x2={xToPx(L + rightCant)} y2={yBeam} className="struct-line" />
+
+      {/* Supports: A is a pin, B is a roller */}
+      <polygon points={`${xToPx(0) - 8},${yBeam + 14} ${xToPx(0) + 8},${yBeam + 14} ${xToPx(0)},${yBeam}`} className="support-tri" />
+      <line x1={xToPx(0) - 14} y1={yBeam + 18} x2={xToPx(0) + 14} y2={yBeam + 18} stroke="#4b5563" strokeWidth="1.5" />
+      <circle cx={xToPx(L)} cy={yBeam + 7} r={7} className="support-tri" />
+      <line x1={xToPx(L) - 14} y1={yBeam + 18} x2={xToPx(L) + 14} y2={yBeam + 18} stroke="#4b5563" strokeWidth="1.5" />
+
+      {/* Section marker */}
+      {sectionMark !== undefined && sectionMark !== null && (
+        <g>
+          <line x1={xToPx(sectionMark)} y1={margin.t + 14} x2={xToPx(sectionMark)} y2={yBeam + 6}
+            stroke="#dc2626" strokeWidth="1.5" strokeDasharray="3,2" />
+          <text x={xToPx(sectionMark)} y={margin.t + 10} textAnchor="middle" fontSize="10" fontWeight="600" fill="#dc2626">
+            section x = {fmt(sectionMark, 1)}
+          </text>
+        </g>
+      )}
+    </svg>
+  );
+}
+
+/* ============================================================
+   STRUCTURE DIAGRAM
+   ============================================================ */
+function StructureDiagram({ leftCant, L, rightCant, sectionMark }) {
+  const W = 880, H = 100;
+  const margin = { l: 40, r: 40, t: 30, b: 30 };
+  const total = leftCant + L + rightCant;
+  const xToPx = x => margin.l + ((x + leftCant) / total) * (W - margin.l - margin.r);
+  const y = H - margin.b;
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: '120px' }}>
+      <line x1={xToPx(-leftCant)} y1={y} x2={xToPx(L + rightCant)} y2={y} className="struct-line" />
+      {/* support A: pin (triangle on hatching) */}
+      <polygon points={`${xToPx(0) - 8},${y + 14} ${xToPx(0) + 8},${y + 14} ${xToPx(0)},${y}`} className="support-tri" />
+      <line x1={xToPx(0) - 14} y1={y + 18} x2={xToPx(0) + 14} y2={y + 18} stroke="#4b5563" strokeWidth="1.5" />
+      {/* support B: roller (circle on hatching) */}
+      <circle cx={xToPx(L)} cy={y + 7} r={7} className="support-tri" />
+      <line x1={xToPx(L) - 14} y1={y + 18} x2={xToPx(L) + 14} y2={y + 18} stroke="#4b5563" strokeWidth="1.5" />
+      {/* labels */}
+      <text x={xToPx(0)} y={y - 8} textAnchor="middle" fontSize="11" fontWeight="600" fill="#1e293b">A</text>
+      <text x={xToPx(L)} y={y - 8} textAnchor="middle" fontSize="11" fontWeight="600" fill="#1e293b">B</text>
+      <text x={xToPx(L / 2)} y={y - 18} textAnchor="middle" fontSize="11" fill="#475569">L = {L} ft</text>
+      {leftCant > 0 && <text x={xToPx(-leftCant / 2)} y={y - 8} textAnchor="middle" fontSize="10" fill="#64748b">{leftCant} ft</text>}
+      {rightCant > 0 && <text x={xToPx(L + rightCant / 2)} y={y - 8} textAnchor="middle" fontSize="10" fill="#64748b">{rightCant} ft</text>}
+      {/* section marker */}
+      {sectionMark !== undefined && sectionMark !== null && (
+        <g>
+          <line x1={xToPx(sectionMark)} y1={y - 22} x2={xToPx(sectionMark)} y2={y + 6} stroke="#dc2626" strokeWidth="1.5" strokeDasharray="3,2" />
+          <text x={xToPx(sectionMark)} y={y - 26} textAnchor="middle" fontSize="10" fontWeight="600" fill="#dc2626">x = {fmt(sectionMark, 1)}</text>
+        </g>
+      )}
+    </svg>
+  );
+}
+
+/* ============================================================
+   ENVELOPE PLOT (M or V)
+   ============================================================ */
+function EnvelopePlot({ sections, posSeries, negSeries, leftCant, L, rightCant, ylabel, posLabel, negLabel, posUnit }) {
+  const W = 880, H = 320;
+  const margin = { l: 70, r: 30, t: 30, b: 50 };
+  const xMin = -leftCant, xMax = L + rightCant;
+  const allVals = [...posSeries, ...negSeries].filter(v => isFinite(v));
+  let yMin = Math.min(0, ...allVals);
+  let yMax = Math.max(0, ...allVals);
+  if (yMax === 0 && yMin === 0) { yMax = 1; yMin = -1; }
+  const padY = 0.08 * (yMax - yMin);
+  yMax += padY; yMin -= padY;
+
+  const xPx = x => margin.l + ((x - xMin) / (xMax - xMin)) * (W - margin.l - margin.r);
+  const yPx = v => margin.t + ((yMax - v) / (yMax - yMin)) * (H - margin.t - margin.b);
+
+  const niceTicks = (lo, hi, n) => {
+    const range = hi - lo;
+    const rough = range / n;
+    const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+    const norm = rough / mag;
+    let step = norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10;
+    step *= mag;
+    const ticks = [];
+    const start = Math.ceil(lo / step) * step;
+    for (let v = start; v <= hi + 1e-9; v += step) ticks.push(+v.toFixed(8));
+    return ticks;
+  };
+  const xTicks = niceTicks(xMin, xMax, 8);
+  const yTicks = niceTicks(yMin, yMax, 6);
+
+  const polyPoints = (xs, ys) => xs.map((x, i) => `${xPx(x)},${yPx(ys[i])}`).join(' ');
+
+  const posArea = `${xPx(sections[0])},${yPx(0)} ${polyPoints(sections, posSeries)} ${xPx(sections[sections.length - 1])},${yPx(0)}`;
+  const negArea = `${xPx(sections[0])},${yPx(0)} ${polyPoints(sections, negSeries)} ${xPx(sections[sections.length - 1])},${yPx(0)}`;
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: '380px' }}>
+      {/* gridlines */}
+      {xTicks.map((t, i) => (
+        <line key={`gx${i}`} x1={xPx(t)} y1={margin.t} x2={xPx(t)} y2={H - margin.b} className="grid-line" />
+      ))}
+      {yTicks.map((t, i) => (
+        <line key={`gy${i}`} x1={margin.l} y1={yPx(t)} x2={W - margin.r} y2={yPx(t)} className="grid-line" />
+      ))}
+
+      {/* zero line */}
+      <line x1={margin.l} y1={yPx(0)} x2={W - margin.r} y2={yPx(0)} stroke="#1f2937" strokeWidth="1" />
+
+      {/* envelope fills */}
+      <polygon points={posArea} fill="#3b82f6" fillOpacity="0.35" stroke="#1d4ed8" strokeWidth="1.5" />
+      <polygon points={negArea} fill="#ef4444" fillOpacity="0.35" stroke="#b91c1c" strokeWidth="1.5" />
+
+      {/* support markers */}
+      <line x1={xPx(0)} y1={margin.t} x2={xPx(0)} y2={H - margin.b} stroke="#475569" strokeWidth="1" strokeDasharray="4,3" />
+      <line x1={xPx(L)} y1={margin.t} x2={xPx(L)} y2={H - margin.b} stroke="#475569" strokeWidth="1" strokeDasharray="4,3" />
+
+      {/* axes */}
+      <line x1={margin.l} y1={margin.t} x2={margin.l} y2={H - margin.b} className="axis-line" />
+      <line x1={margin.l} y1={H - margin.b} x2={W - margin.r} y2={H - margin.b} className="axis-line" />
+
+      {/* tick labels */}
+      {xTicks.map((t, i) => (
+        <text key={`tx${i}`} x={xPx(t)} y={H - margin.b + 14} textAnchor="middle" className="axis-text">{t}</text>
+      ))}
+      {yTicks.map((t, i) => (
+        <text key={`ty${i}`} x={margin.l - 6} y={yPx(t) + 4} textAnchor="end" className="axis-text num">{fmt(t, Math.abs(t) >= 100 ? 0 : 1)}</text>
+      ))}
+
+      {/* axis titles */}
+      <text x={(margin.l + W - margin.r) / 2} y={H - 8} textAnchor="middle" className="axis-title">Section position x (ft)</text>
+      <text x={16} y={(margin.t + H - margin.b) / 2} textAnchor="middle" className="axis-title"
+        transform={`rotate(-90, 16, ${(margin.t + H - margin.b) / 2})`}>{ylabel} ({posUnit})</text>
+
+      {/* legend */}
+      <g transform={`translate(${W - margin.r - 200}, ${margin.t + 6})`}>
+        <rect x={0} y={0} width={194} height={42} fill="white" stroke="#cbd5e1" rx={4} />
+        <rect x={8} y={8} width={14} height={10} fill="#3b82f6" fillOpacity="0.4" stroke="#1d4ed8" />
+        <text x={28} y={17} fontSize="11" fill="#1e293b">{posLabel}</text>
+        <rect x={8} y={24} width={14} height={10} fill="#ef4444" fillOpacity="0.4" stroke="#b91c1c" />
+        <text x={28} y={33} fontSize="11" fill="#1e293b">{negLabel}</text>
+      </g>
+    </svg>
+  );
+}
+
+/* ============================================================
+   IL PLOT, just the influence line. Placement of the train at the
+   optimal position is shown separately in a BeamWithTrain diagram below.
+   ============================================================ */
+function ILPlot({ samples, leftCant, L, rightCant, x, type, side }) {
+  const W = 880, H = 300;
+  const margin = { l: 70, r: 30, t: 24, b: 50 };
+  const xMin = -leftCant, xMax = L + rightCant;
+
+  const vals = samples.map(s => s.val);
+  let yMin = Math.min(0, ...vals);
+  let yMax = Math.max(0, ...vals);
+  const padY = 0.15 * (yMax - yMin || 1);
+  yMax += padY; yMin -= padY;
+
+  const xPx = p => margin.l + ((p - xMin) / (xMax - xMin)) * (W - margin.l - margin.r);
+  const yPx = v => margin.t + ((yMax - v) / (yMax - yMin)) * (H - margin.t - margin.b);
+
+  const niceTicks = (lo, hi, n) => {
+    const range = hi - lo;
+    const rough = range / n;
+    const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+    const norm = rough / mag;
+    let step = norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10;
+    step *= mag;
+    const ticks = [];
+    const start = Math.ceil(lo / step) * step;
+    for (let v = start; v <= hi + 1e-9; v += step) ticks.push(+v.toFixed(8));
+    return ticks;
+  };
+  const xTicks = niceTicks(xMin, xMax, 8);
+  const yTicks = niceTicks(yMin, yMax, 6);
+
+  const polyPts = samples.map(s => `${xPx(s.p)},${yPx(s.val)}`).join(' ');
+  const fillPts = `${xPx(samples[0].p)},${yPx(0)} ${polyPts} ${xPx(samples[samples.length-1].p)},${yPx(0)}`;
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: '360px' }}>
+      {xTicks.map((t, i) => (
+        <line key={`gx${i}`} x1={xPx(t)} y1={margin.t} x2={xPx(t)} y2={H - margin.b} className="grid-line" />
+      ))}
+      {yTicks.map((t, i) => (
+        <line key={`gy${i}`} x1={margin.l} y1={yPx(t)} x2={W - margin.r} y2={yPx(t)} className="grid-line" />
+      ))}
+
+      <line x1={margin.l} y1={yPx(0)} x2={W - margin.r} y2={yPx(0)} stroke="#1f2937" strokeWidth="1" />
+
+      <line x1={xPx(0)} y1={margin.t} x2={xPx(0)} y2={H - margin.b} stroke="#475569" strokeWidth="1" strokeDasharray="4,3" />
+      <line x1={xPx(L)} y1={margin.t} x2={xPx(L)} y2={H - margin.b} stroke="#475569" strokeWidth="1" strokeDasharray="4,3" />
+
+      <polygon points={fillPts} fill="#a855f7" fillOpacity="0.18" />
+      <polyline points={polyPts} fill="none" stroke="#7e22ce" strokeWidth="1.8" />
+
+      <line x1={xPx(x)} y1={margin.t} x2={xPx(x)} y2={H - margin.b} stroke="#dc2626" strokeWidth="1.5" strokeDasharray="3,2" />
+      <text x={xPx(x)} y={margin.t - 4} textAnchor="middle" fontSize="10" fontWeight="600" fill="#dc2626">section x = {fmt(x, 1)}</text>
+
+      <line x1={margin.l} y1={margin.t} x2={margin.l} y2={H - margin.b} className="axis-line" />
+      <line x1={margin.l} y1={H - margin.b} x2={W - margin.r} y2={H - margin.b} className="axis-line" />
+
+      {xTicks.map((t, i) => (
+        <text key={`tx${i}`} x={xPx(t)} y={H - margin.b + 14} textAnchor="middle" className="axis-text">{t}</text>
+      ))}
+      {yTicks.map((t, i) => (
+        <text key={`ty${i}`} x={margin.l - 6} y={yPx(t) + 4} textAnchor="end" className="axis-text num">{fmt(t, 3)}</text>
+      ))}
+
+      <text x={(margin.l + W - margin.r) / 2} y={H - 8} textAnchor="middle" className="axis-title">Unit-load position p (ft)</text>
+      <text x={16} y={(margin.t + H - margin.b) / 2} textAnchor="middle" className="axis-title"
+        transform={`rotate(-90, 16, ${(margin.t + H - margin.b) / 2})`}>
+        IL for {type === 'M' ? 'moment' : `shear (${side})`} at section
+      </text>
+    </svg>
+  );
+}
+
+/* ============================================================
+   RESULTS TABLES
+   ============================================================ */
+function PeakTable({ sections, env, L, leftCant, rightCant, srcMap }) {
+  const findPeak = (arr, mode) => {
+    let idx = 0;
+    for (let i = 1; i < arr.length; i++) {
+      if (mode === 'max' && arr[i] > arr[idx]) idx = i;
+      if (mode === 'min' && arr[i] < arr[idx]) idx = i;
+    }
+    return { idx, val: arr[idx], x: sections[idx] };
+  };
+  const Mp = findPeak(env.Mmax, 'max');
+  const Mn = findPeak(env.Mmin, 'min');
+  const Vp = findPeak(env.Vmax, 'max');
+  const Vn = findPeak(env.Vmin, 'min');
+
+  return (
+    <table className="results text-sm w-full">
+      <thead>
+        <tr className="bg-slate-100 text-slate-700 text-left">
+          <th>Quantity</th><th>Peak Value</th><th>Location x (ft)</th>
+          {srcMap && <th>Governing</th>}
+        </tr>
+      </thead>
+      <tbody>
+        <tr className="border-b border-slate-200">
+          <td>Maximum positive moment, M+</td>
+          <td className="num font-semibold text-blue-700">{fmt(Mp.val, 1)} k-ft</td>
+          <td className="num">{fmt(Mp.x, 2)}</td>
+          {srcMap && <td className="text-xs text-slate-600">{srcMap.MmaxSrc[Mp.idx]}</td>}
+        </tr>
+        <tr className="border-b border-slate-200">
+          <td>Minimum (negative) moment, M-</td>
+          <td className="num font-semibold text-rose-700">{fmt(Mn.val, 1)} k-ft</td>
+          <td className="num">{fmt(Mn.x, 2)}</td>
+          {srcMap && <td className="text-xs text-slate-600">{srcMap.MminSrc[Mn.idx]}</td>}
+        </tr>
+        <tr className="border-b border-slate-200">
+          <td>Maximum positive shear, V+</td>
+          <td className="num font-semibold text-blue-700">{fmt(Vp.val, 1)} k</td>
+          <td className="num">{fmt(Vp.x, 2)}</td>
+          {srcMap && <td className="text-xs text-slate-600">{srcMap.VmaxSrc[Vp.idx]}</td>}
+        </tr>
+        <tr className="border-b border-slate-200">
+          <td>Minimum (negative) shear, V-</td>
+          <td className="num font-semibold text-rose-700">{fmt(Vn.val, 1)} k</td>
+          <td className="num">{fmt(Vn.x, 2)}</td>
+          {srcMap && <td className="text-xs text-slate-600">{srcMap.VminSrc[Vn.idx]}</td>}
+        </tr>
+      </tbody>
+    </table>
+  );
+}
+
+function FullEnvelopeTable({ sections, env, srcMap }) {
+  return (
+    <div className="overflow-auto max-h-96 border border-slate-200 rounded-md">
+      <table className="results text-sm w-full">
+        <thead className="sticky top-0 bg-slate-100 text-slate-700">
+          <tr>
+            <th>x (ft)</th>
+            <th>M+ (k-ft)</th><th>M- (k-ft)</th>
+            <th>V+ (k)</th><th>V- (k)</th>
+            {srcMap && <><th className="text-xs">M+ src</th><th className="text-xs">M- src</th><th className="text-xs">V+ src</th><th className="text-xs">V- src</th></>}
+          </tr>
+        </thead>
+        <tbody>
+          {sections.map((x, i) => (
+            <tr key={i} className="border-b border-slate-100">
+              <td className="num">{fmt(x, 2)}</td>
+              <td className="num text-blue-700">{fmt(env.Mmax[i], 1)}</td>
+              <td className="num text-rose-700">{fmt(env.Mmin[i], 1)}</td>
+              <td className="num text-blue-700">{fmt(env.Vmax[i], 1)}</td>
+              <td className="num text-rose-700">{fmt(env.Vmin[i], 1)}</td>
+              {srcMap && <>
+                <td className="text-xs text-slate-600">{srcMap.MmaxSrc[i]}</td>
+                <td className="text-xs text-slate-600">{srcMap.MminSrc[i]}</td>
+                <td className="text-xs text-slate-600">{srcMap.VmaxSrc[i]}</td>
+                <td className="text-xs text-slate-600">{srcMap.VminSrc[i]}</td>
+              </>}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ============================================================
+   MAIN APP
+   ============================================================ */
+function App() {
+  // Geometry inputs
+  const [L, setL] = useState(80);
+  const [Cl, setCl] = useState(0);
+  const [Cr, setCr] = useState(0);
+
+  // Loading
+  const [eRating, setERating] = useState(80);
+  const [numLoco, setNumLoco] = useState(2);
+  const [includeAlt, setIncludeAlt] = useState(true);
+
+  // Dead load (uniform, k/ft) -- not amplified by impact
+  const [wDL, setWDL] = useState(1.0);
+
+  // Dynamic impact factor.
+  // Default behavior: auto-compute from AREMA Ch.15 rolling-equipment-without-hammer-blow:
+  //   L <  80 ft : IM = (40 - 3*L^2/1600) / 100
+  //   L >= 80 ft : IM = (16 + 600/(L-30))  / 100
+  // Live-load multiplier I = 1 + IM. User can switch off auto and enter their own I.
+  const [autoImpact, setAutoImpact] = useState(true);
+  const [manualImpact, setManualImpact] = useState(1.0);
+
+  const aremaImpact = useMemo(() => {
+    if (!isFinite(L) || L <= 0) return 1.0;
+    if (L < 80) return 1 + (40 - 3 * L * L / 1600) / 100;
+    return 1 + (16 + 600 / (L - 30)) / 100;
+  }, [L]);
+
+  const impactFactor = autoImpact ? aremaImpact : manualImpact;
+
+  const setAutoImpactWithCopy = (checked) => {
+    if (!checked) setManualImpact(+aremaImpact.toFixed(4));
+    setAutoImpact(checked);
+  };
+
+  // Analysis (fixed defaults; not user-editable)
+  const step = 1.0;          // lead-axle increment, ft
+  const sectionStep = 2.0;   // section grid spacing, ft
+
+  // Tabs
+  const [tab, setTab] = useState('cooper');
+
+  // IL section input
+  const [ilSectionX, setIlSectionX] = useState(40);
+  const [ilType, setIlType] = useState('M');
+  const [ilShearSide, setIlShearSide] = useState('right');
+
+  // Build consists
+  const cooper = useMemo(() => generateCooperConsist(eRating, numLoco), [eRating, numLoco]);
+  const alt = useMemo(() => generateAlternateConsist(), []);
+
+  // Section grid: base spacing + flanking points at each support (s +/- 0.001)
+  // so the shear envelope shows the discontinuity cleanly.
+  const sections = useMemo(() => {
+    const xs = [];
+    const xMin = -Cl, xMax = L + Cr;
+    const flankEps = 0.001;
+    // Base grid, skipping points that fall on or right next to a support
+    for (let x = xMin; x <= xMax + 1e-9; x += sectionStep) {
+      const v = +x.toFixed(6);
+      const onSupport = Math.abs(v - 0) < flankEps * 0.4 || Math.abs(v - L) < flankEps * 0.4;
+      if (!onSupport) xs.push(v);
+    }
+    // Cantilever tip: include xMax if not already and not near a support
+    if (xs.length === 0 || xMax - xs[xs.length - 1] > flankEps) {
+      const xMaxOnSupport = Math.abs(xMax - 0) < flankEps * 0.4 || Math.abs(xMax - L) < flankEps * 0.4;
+      if (!xMaxOnSupport) xs.push(+xMax.toFixed(6));
+    }
+    // Flanking points around supports (only if within structure bounds)
+    for (const s of [0, L]) {
+      if (s - flankEps >= xMin - 1e-9) xs.push(+(s - flankEps).toFixed(6));
+      if (s + flankEps <= xMax + 1e-9) xs.push(+(s + flankEps).toFixed(6));
+    }
+    xs.sort((a, b) => a - b);
+    // Dedup
+    const dedup = [];
+    for (const x of xs) {
+      if (dedup.length === 0 || x - dedup[dedup.length - 1] > 1e-7) dedup.push(x);
+    }
+    return dedup;
+  }, [L, Cl, Cr, sectionStep]);
+
+  // Live-load envelopes (raw, before impact)
+  const cooperEnvRaw = useMemo(
+    () => movingLoadEnvelope(cooper, Cl, L, Cr, sections, step),
+    [cooper, Cl, L, Cr, sections, step]
+  );
+  const altEnvRaw = useMemo(
+    () => movingLoadEnvelope(alt, Cl, L, Cr, sections, step),
+    [alt, Cl, L, Cr, sections, step]
+  );
+
+  // Helper: scale an envelope by impact factor
+  const scaleEnv = (env, k) => ({
+    ...env,
+    Mmax: env.Mmax.map(v => v * k),
+    Mmin: env.Mmin.map(v => v * k),
+    Vmax: env.Vmax.map(v => v * k),
+    Vmin: env.Vmin.map(v => v * k)
+  });
+
+  // Live-load envelopes with impact applied (for display)
+  const cooperEnv = useMemo(() => scaleEnv(cooperEnvRaw, impactFactor), [cooperEnvRaw, impactFactor]);
+  const altEnv = useMemo(() => scaleEnv(altEnvRaw, impactFactor), [altEnvRaw, impactFactor]);
+
+  // Design envelope: worst of (Cooper, Alt-if-included), with impact applied
+  const designEnv = useMemo(() => {
+    const list = [];
+    list.push({ name: cooper.name, short: cooper.short, env: cooperEnv });
+    if (includeAlt) list.push({ name: alt.name, short: alt.short, env: altEnv });
+    const N = sections.length;
+    const combined = {
+      Mmax: new Array(N).fill(-Infinity),
+      Mmin: new Array(N).fill(Infinity),
+      Vmax: new Array(N).fill(-Infinity),
+      Vmin: new Array(N).fill(Infinity),
+      MmaxSrc: new Array(N).fill(''),
+      MminSrc: new Array(N).fill(''),
+      VmaxSrc: new Array(N).fill(''),
+      VminSrc: new Array(N).fill('')
+    };
+    for (const item of list) {
+      for (let s = 0; s < N; s++) {
+        if (item.env.Mmax[s] > combined.Mmax[s]) { combined.Mmax[s] = item.env.Mmax[s]; combined.MmaxSrc[s] = item.short; }
+        if (item.env.Mmin[s] < combined.Mmin[s]) { combined.Mmin[s] = item.env.Mmin[s]; combined.MminSrc[s] = item.short; }
+        if (item.env.Vmax[s] > combined.Vmax[s]) { combined.Vmax[s] = item.env.Vmax[s]; combined.VmaxSrc[s] = item.short; }
+        if (item.env.Vmin[s] < combined.Vmin[s]) { combined.Vmin[s] = item.env.Vmin[s]; combined.VminSrc[s] = item.short; }
+      }
+    }
+    return { combined, perConsist: list };
+  }, [cooperEnv, altEnv, includeAlt, cooper, alt, sections]);
+
+  // Dead load envelope (no impact)
+  const dlEnv = useMemo(
+    () => deadLoadEnvelope(wDL, Cl, L, Cr, sections),
+    [wDL, Cl, L, Cr, sections]
+  );
+
+  // IL samples + optimal placements (recomputed when section/type changes)
+  const ilSamples = useMemo(
+    () => computeILSamples(ilSectionX, L, Cl, Cr, ilType, ilShearSide),
+    [ilSectionX, L, Cl, Cr, ilType, ilShearSide]
+  );
+  const ilOptimalCooperRaw = useMemo(
+    () => findOptimalPlacement(cooper, ilSectionX, L, Cl, Cr, ilType, ilShearSide, step),
+    [cooper, ilSectionX, L, Cl, Cr, ilType, ilShearSide, step]
+  );
+  const ilOptimalAltRaw = useMemo(
+    () => findOptimalPlacement(alt, ilSectionX, L, Cl, Cr, ilType, ilShearSide, step),
+    [alt, ilSectionX, L, Cl, Cr, ilType, ilShearSide, step]
+  );
+  // Apply impact factor to optimal placement values
+  const ilOptimalCooper = {
+    positive: { ...ilOptimalCooperRaw.positive, val: ilOptimalCooperRaw.positive.val * impactFactor },
+    negative: { ...ilOptimalCooperRaw.negative, val: ilOptimalCooperRaw.negative.val * impactFactor }
+  };
+  const ilOptimalAlt = {
+    positive: { ...ilOptimalAltRaw.positive, val: ilOptimalAltRaw.positive.val * impactFactor },
+    negative: { ...ilOptimalAltRaw.negative, val: ilOptimalAltRaw.negative.val * impactFactor }
+  };
+
+  // Choose which loading to show on IL plot: bigger magnitude (impact-scaled)
+  const ilPickedConsist = (() => {
+    if (!includeAlt) return { consist: cooper, opt: ilOptimalCooper };
+    const cMag = Math.max(Math.abs(ilOptimalCooper.positive.val), Math.abs(ilOptimalCooper.negative.val));
+    const aMag = Math.max(Math.abs(ilOptimalAlt.positive.val), Math.abs(ilOptimalAlt.negative.val));
+    return cMag >= aMag ? { consist: cooper, opt: ilOptimalCooper } : { consist: alt, opt: ilOptimalAlt };
+  })();
+  const ilShowSign = (Math.abs(ilPickedConsist.opt.positive.val) >= Math.abs(ilPickedConsist.opt.negative.val))
+    ? 'positive' : 'negative';
+
+  return (
+    <div className="max-w-7xl mx-auto p-4 sm:p-6">
+      {/* Header */}
+      <header className="mb-6">
+        <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight">
+          Bridge Train Loading Analysis
+        </h1>
+        <p className="text-sm text-slate-600 mt-1">
+          Cooper E-XX + AREMA Alternate Live Load on simply-supported span with optional cantilevers.
+        </p>
+      </header>
+
+      {/* Inputs */}
+      <section className="bg-white rounded-lg shadow-sm border border-slate-200 p-4 sm:p-5 mb-5">
+        <details open>
+          <summary className="text-sm font-semibold text-slate-800 mb-3">Geometry & Loading</summary>
+
+          {/* Row 1: Structure */}
+          <div className="mt-3">
+            <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Structure</div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+              <NumInput label="Span L" value={L} onChange={v => setL(v || 0)} suffix="ft" step={1} min={1} />
+              <NumInput label="Left Cantilever" value={Cl} onChange={v => setCl(Math.max(0, v || 0))} suffix="ft" step={1} min={0} />
+              <NumInput label="Right Cantilever" value={Cr} onChange={v => setCr(Math.max(0, v || 0))} suffix="ft" step={1} min={0} />
+            </div>
+          </div>
+
+          {/* Row 2: Live loads + impact */}
+          <div className="mt-4 pt-4 border-t border-slate-100">
+            <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Live Loads &amp; Impact</div>
+            <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+              <NumInput label="E-Rating" value={eRating} onChange={v => setERating(v || 80)} suffix="(E-XX)" step={1} min={50} max={120}
+                hint="Loads scale by E/80" />
+              <SelectInput label="Locomotives" value={String(numLoco)} onChange={v => setNumLoco(parseInt(v))}
+                options={[{value: '1', label: '1 locomotive'}, {value: '2', label: '2 locomotives'}, {value: '3', label: '3 locomotives'}]} />
+              <div className="flex flex-col">
+                <label className="text-xs font-semibold text-slate-700 mb-1 uppercase tracking-wide">AREMA Alternate</label>
+                <label className="inline-flex items-center text-sm pt-1.5 cursor-pointer">
+                  <input type="checkbox" checked={includeAlt} onChange={e => setIncludeAlt(e.target.checked)}
+                    className="mr-2 w-4 h-4" />
+                  Include in design envelope
+                </label>
+              </div>
+              <div className="flex flex-col">
+                <label className="text-xs font-semibold text-slate-700 mb-1 uppercase tracking-wide">Impact Factor</label>
+                <div className="flex items-center">
+                  <input
+                    type="number"
+                    className={`num w-full px-2 py-1.5 border border-slate-300 rounded-md focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm ${autoImpact ? 'bg-slate-100 text-slate-600' : ''}`}
+                    value={impactFactor.toFixed(3)}
+                    onChange={e => setManualImpact(Math.max(0, parseFloat(e.target.value) || 1))}
+                    step={0.01} min={0}
+                    disabled={autoImpact}
+                  />
+                  <span className="ml-2 text-sm text-slate-500">(I)</span>
+                </div>
+                <label className="inline-flex items-center text-xs mt-1 cursor-pointer text-slate-700">
+                  <input type="checkbox" checked={autoImpact} onChange={e => setAutoImpactWithCopy(e.target.checked)}
+                    className="mr-1 w-3.5 h-3.5" />
+                  AREMA Ch.15 default
+                </label>
+                <span className="text-xs text-slate-400 mt-0.5">
+                  {autoImpact
+                    ? `${L < 80 ? '40 - 3*L^2/1600' : '16 + 600/(L-30)'} (rolling, no hammer)`
+                    : `Manual override; AREMA gives ${aremaImpact.toFixed(3)}`}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Row 3: Dead load */}
+          <div className="mt-4 pt-4 border-t border-slate-100">
+            <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Dead Load</div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+              <NumInput label="Uniform Dead Load" value={wDL} onChange={v => setWDL(Math.max(0, v || 0))} suffix="k/ft" step={0.1} min={0}
+                hint="Applied over the full structure; no impact factor" />
+            </div>
+          </div>
+        </details>
+      </section>
+
+      {/* Diagrams */}
+      <section className="bg-white rounded-lg shadow-sm border border-slate-200 p-4 sm:p-5 mb-5">
+        <h2 className="text-sm font-semibold text-slate-800 mb-3">Structure & Train Loading</h2>
+        <StructureDiagram leftCant={Cl} L={L} rightCant={Cr} sectionMark={tab === 'il' ? ilSectionX : null} />
+        <div className="mt-3">
+          <TrainLoadingDiagram consist={cooper} title={`${cooper.name}, axle pattern`} />
+        </div>
+        {includeAlt && (
+          <div className="mt-3 pt-3 border-t border-slate-200">
+            <TrainLoadingDiagram consist={alt} title="AREMA Alternate Live Load, axle pattern" />
+          </div>
+        )}
+        <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs text-slate-600">
+          <div><span className="font-semibold">Total axles ({cooper.short}):</span> <span className="num">{cooper.positions.length}</span></div>
+          <div><span className="font-semibold">Train length:</span> <span className="num">{fmt(cooper.consistLength, 1)} ft</span></div>
+          <div><span className="font-semibold">Uniform start:</span> <span className="num">{fmt(cooper.uniformOffset, 1)} ft from lead</span></div>
+          <div><span className="font-semibold">Uniform load:</span> <span className="num">{fmt(cooper.uniformLoad, 2)} k/ft</span></div>
+        </div>
+      </section>
+
+      {/* Tabs */}
+      <div className="flex gap-1 mb-4 flex-wrap">
+        <button onClick={() => setTab('cooper')} className={`px-4 py-2 rounded-t-md text-sm font-semibold ${tab === 'cooper' ? 'tab-active' : 'tab-inactive'}`}>
+          E-{eRating} Envelope ({numLoco} loco)
+        </button>
+        <button onClick={() => setTab('alt')} className={`px-4 py-2 rounded-t-md text-sm font-semibold ${tab === 'alt' ? 'tab-active' : 'tab-inactive'}`}>
+          AREMA Envelope
+        </button>
+        <button onClick={() => setTab('il')} className={`px-4 py-2 rounded-t-md text-sm font-semibold ${tab === 'il' ? 'tab-active' : 'tab-inactive'}`}>
+          Influence Lines
+        </button>
+        <button onClick={() => setTab('dl')} className={`px-4 py-2 rounded-t-md text-sm font-semibold ${tab === 'dl' ? 'tab-active' : 'tab-inactive'}`}>
+          Dead Load
+        </button>
+        <button onClick={() => setTab('design')} className={`px-4 py-2 rounded-t-md text-sm font-semibold ${tab === 'design' ? 'tab-active' : 'tab-inactive'}`}>
+          Design Envelope
+        </button>
+      </div>
+
+      {/* TAB: Cooper E-XX */}
+      {tab === 'cooper' && (
+        <section className="bg-white rounded-b-lg rounded-tr-lg shadow-sm border border-slate-200 p-4 sm:p-5">
+          <h2 className="text-base font-semibold text-slate-900 mb-1">{cooper.name} Envelope</h2>
+          <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-slate-600 mb-4">
+            <span>Lead axle stepped across structure in both directions; envelopes are over all positions.</span>
+            <span className="px-2 py-0.5 bg-amber-50 border border-amber-300 rounded text-amber-900 font-semibold">
+              Impact factor I = {fmt(impactFactor, 3)} applied
+            </span>
+          </div>
+
+          <h3 className="text-sm font-semibold text-slate-700 mt-4 mb-2">Moment Envelope (live load with impact)</h3>
+          <EnvelopePlot sections={sections} posSeries={cooperEnv.Mmax} negSeries={cooperEnv.Mmin}
+            leftCant={Cl} L={L} rightCant={Cr}
+            ylabel="Moment" posLabel="M+ (positive / sagging)" negLabel="M- (negative / hogging)" posUnit="k-ft" />
+
+          <h3 className="text-sm font-semibold text-slate-700 mt-6 mb-2">Shear Envelope (live load with impact)</h3>
+          <EnvelopePlot sections={sections} posSeries={cooperEnv.Vmax} negSeries={cooperEnv.Vmin}
+            leftCant={Cl} L={L} rightCant={Cr}
+            ylabel="Shear" posLabel="V+ (max)" negLabel="V- (min)" posUnit="k" />
+
+          <h3 className="text-sm font-semibold text-slate-700 mt-6 mb-2">Peak Values (live load with impact)</h3>
+          <PeakTable sections={sections} env={cooperEnv} L={L} leftCant={Cl} rightCant={Cr} />
+
+          <details className="mt-5">
+            <summary className="text-sm font-semibold text-slate-700">Full envelope table</summary>
+            <div className="mt-3">
+              <FullEnvelopeTable sections={sections} env={cooperEnv} />
+            </div>
+          </details>
+        </section>
+      )}
+
+      {/* TAB: AREMA Alternate Envelope */}
+      {tab === 'alt' && (
+        <section className="bg-white rounded-b-lg rounded-tr-lg shadow-sm border border-slate-200 p-4 sm:p-5">
+          <h2 className="text-base font-semibold text-slate-900 mb-1">{alt.name} Envelope</h2>
+          <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-slate-600 mb-4">
+            <span>Four 100-kip axles at 5'-6'-5' spacings stepped in both directions.</span>
+            <span className="px-2 py-0.5 bg-amber-50 border border-amber-300 rounded text-amber-900 font-semibold">
+              Impact factor I = {fmt(impactFactor, 3)} applied
+            </span>
+          </div>
+
+          <h3 className="text-sm font-semibold text-slate-700 mt-4 mb-2">Moment Envelope (live load with impact)</h3>
+          <EnvelopePlot sections={sections} posSeries={altEnv.Mmax} negSeries={altEnv.Mmin}
+            leftCant={Cl} L={L} rightCant={Cr}
+            ylabel="Moment" posLabel="M+ (positive / sagging)" negLabel="M- (negative / hogging)" posUnit="k-ft" />
+
+          <h3 className="text-sm font-semibold text-slate-700 mt-6 mb-2">Shear Envelope (live load with impact)</h3>
+          <EnvelopePlot sections={sections} posSeries={altEnv.Vmax} negSeries={altEnv.Vmin}
+            leftCant={Cl} L={L} rightCant={Cr}
+            ylabel="Shear" posLabel="V+ (max)" negLabel="V- (min)" posUnit="k" />
+
+          <h3 className="text-sm font-semibold text-slate-700 mt-6 mb-2">Peak Values (live load with impact)</h3>
+          <PeakTable sections={sections} env={altEnv} L={L} leftCant={Cl} rightCant={Cr} />
+
+          <details className="mt-5">
+            <summary className="text-sm font-semibold text-slate-700">Full envelope table</summary>
+            <div className="mt-3">
+              <FullEnvelopeTable sections={sections} env={altEnv} />
+            </div>
+          </details>
+        </section>
+      )}
+
+      {/* TAB: Dead Load */}
+      {tab === 'dl' && (
+        <section className="bg-white rounded-b-lg rounded-tr-lg shadow-sm border border-slate-200 p-4 sm:p-5">
+          <h2 className="text-base font-semibold text-slate-900 mb-1">Dead Load Forces</h2>
+          <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-slate-600 mb-4">
+            <span>Uniform dead load over the entire structure.</span>
+            <span className="px-2 py-0.5 bg-slate-100 border border-slate-300 rounded text-slate-800 font-semibold">
+              w_DL = {fmt(wDL, 3)} k/ft, no impact factor
+            </span>
+          </div>
+
+          {wDL <= 0 && (
+            <div className="my-4 p-3 bg-slate-50 border border-slate-200 rounded text-sm text-slate-600">
+              Dead load is currently 0. Enter a value in the inputs above to compute moment and shear from self-weight or other uniform DL.
+            </div>
+          )}
+
+          {wDL > 0 && (
+            <>
+              <h3 className="text-sm font-semibold text-slate-700 mt-4 mb-2">Dead Load Moment</h3>
+              <EnvelopePlot sections={sections} posSeries={dlEnv.M} negSeries={dlEnv.M}
+                leftCant={Cl} L={L} rightCant={Cr}
+                ylabel="M_DL" posLabel="M_DL" negLabel="M_DL" posUnit="k-ft" />
+
+              <h3 className="text-sm font-semibold text-slate-700 mt-6 mb-2">Dead Load Shear</h3>
+              <EnvelopePlot sections={sections} posSeries={dlEnv.Vright} negSeries={dlEnv.Vleft}
+                leftCant={Cl} L={L} rightCant={Cr}
+                ylabel="V_DL" posLabel="V (right of section)" negLabel="V (left of section)" posUnit="k" />
+
+              <h3 className="text-sm font-semibold text-slate-700 mt-6 mb-2">Peak Dead Load Values</h3>
+              {(() => {
+                const findPeak = (arr, mode) => {
+                  let idx = 0;
+                  for (let i = 1; i < arr.length; i++) {
+                    if (mode === 'max' && arr[i] > arr[idx]) idx = i;
+                    if (mode === 'min' && arr[i] < arr[idx]) idx = i;
+                  }
+                  return { val: arr[idx], x: sections[idx] };
+                };
+                const Mp = findPeak(dlEnv.M, 'max'), Mn = findPeak(dlEnv.M, 'min');
+                const Vlmax = findPeak(dlEnv.Vleft, 'max'), Vlmin = findPeak(dlEnv.Vleft, 'min');
+                const Vrmax = findPeak(dlEnv.Vright, 'max'), Vrmin = findPeak(dlEnv.Vright, 'min');
+                return (
+                  <table className="results text-sm w-full">
+                    <thead>
+                      <tr className="bg-slate-100 text-slate-700 text-left">
+                        <th>Quantity</th><th>Peak Value</th><th>Location x (ft)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr className="border-b border-slate-200"><td>Maximum positive moment, M+</td>
+                        <td className="num font-semibold text-blue-700">{fmt(Mp.val, 1)} k-ft</td>
+                        <td className="num">{fmt(Mp.x, 2)}</td></tr>
+                      <tr className="border-b border-slate-200"><td>Minimum (negative) moment, M-</td>
+                        <td className="num font-semibold text-rose-700">{fmt(Mn.val, 1)} k-ft</td>
+                        <td className="num">{fmt(Mn.x, 2)}</td></tr>
+                      <tr className="border-b border-slate-200"><td>Maximum shear (right of section)</td>
+                        <td className="num font-semibold text-blue-700">{fmt(Vrmax.val, 1)} k</td>
+                        <td className="num">{fmt(Vrmax.x, 2)}</td></tr>
+                      <tr className="border-b border-slate-200"><td>Minimum shear (right of section)</td>
+                        <td className="num font-semibold text-rose-700">{fmt(Vrmin.val, 1)} k</td>
+                        <td className="num">{fmt(Vrmin.x, 2)}</td></tr>
+                    </tbody>
+                  </table>
+                );
+              })()}
+
+              <details className="mt-5">
+                <summary className="text-sm font-semibold text-slate-700">Full dead load table</summary>
+                <div className="mt-3 overflow-auto max-h-96 border border-slate-200 rounded-md">
+                  <table className="results text-sm w-full">
+                    <thead className="sticky top-0 bg-slate-100 text-slate-700">
+                      <tr>
+                        <th>x (ft)</th><th>M_DL (k-ft)</th>
+                        <th>V_DL just left (k)</th><th>V_DL just right (k)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sections.map((x, i) => (
+                        <tr key={i} className="border-b border-slate-100">
+                          <td className="num">{fmt(x, 3)}</td>
+                          <td className="num text-blue-700">{fmt(dlEnv.M[i], 1)}</td>
+                          <td className="num">{fmt(dlEnv.Vleft[i], 1)}</td>
+                          <td className="num">{fmt(dlEnv.Vright[i], 1)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            </>
+          )}
+        </section>
+      )}
+
+      {/* TAB: IL */}
+      {tab === 'il' && (
+        <section className="bg-white rounded-b-lg rounded-tr-lg shadow-sm border border-slate-200 p-4 sm:p-5">
+          <h2 className="text-base font-semibold text-slate-900 mb-1">Influence Line Analysis</h2>
+          <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-slate-600 mb-4">
+            <span>Place axles at IL critical positions; uniform integrated by trapezoidal rule with zero-crossing detection.</span>
+            <span className="px-2 py-0.5 bg-amber-50 border border-amber-300 rounded text-amber-900 font-semibold">
+              Impact factor I = {fmt(impactFactor, 3)} applied to placement values
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+            <NumInput label="Section x" value={ilSectionX} onChange={v => setIlSectionX(v || 0)} suffix="ft" step={0.5}
+              min={-Cl} max={L + Cr} hint={`Range: ${-Cl} to ${L + Cr}`} />
+            <SelectInput label="IL Type" value={ilType} onChange={setIlType}
+              options={[{value: 'M', label: 'Moment'}, {value: 'V', label: 'Shear'}]} />
+            {ilType === 'V' && (
+              <SelectInput label="Shear Side" value={ilShearSide} onChange={setIlShearSide}
+                options={[{value: 'left', label: 'Just left of section'}, {value: 'right', label: 'Just right of section'}]} />
+            )}
+          </div>
+
+          <h3 className="text-sm font-semibold text-slate-700 mb-1">Influence Line</h3>
+          <ILPlot samples={ilSamples} leftCant={Cl} L={L} rightCant={Cr} x={ilSectionX}
+            type={ilType} side={ilShearSide} />
+
+          <h3 className="text-sm font-semibold text-slate-700 mt-5 mb-1">
+            Governing Train Loading at Optimal Position
+          </h3>
+          <p className="text-xs text-slate-600 mb-2">
+            Train shown is whichever loading produces the larger-magnitude response at this section,
+            placed at its optimal lead-axle position and travel direction.
+          </p>
+          <BeamWithTrain
+            consist={ilPickedConsist.consist}
+            xLead={ilPickedConsist.opt[ilShowSign].xLead}
+            direction={ilPickedConsist.opt[ilShowSign].direction}
+            leftCant={Cl} L={L} rightCant={Cr}
+            sectionMark={ilSectionX}
+            label={`${ilPickedConsist.consist.name}, ${ilShowSign} response = ${fmt(ilPickedConsist.opt[ilShowSign].val, 2)} ${ilType === 'M' ? 'k-ft' : 'k'}`}
+          />
+
+          <div className="mt-4">
+            <h3 className="text-sm font-semibold text-slate-700 mb-2">Optimal Placement at this Section</h3>
+            <table className="results text-sm w-full">
+              <thead>
+                <tr className="bg-slate-100 text-slate-700 text-left">
+                  <th>Train Loading</th><th>Quantity</th><th>Value</th><th>Lead-Axle Position (ft)</th><th>Lead Axle Travel</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr className="border-b border-slate-200">
+                  <td>{cooper.name}</td>
+                  <td>Maximum positive {ilType === 'M' ? 'M' : `V (${ilShearSide})`}</td>
+                  <td className="num font-semibold text-blue-700">{fmt(ilOptimalCooper.positive.val, 2)} {ilType === 'M' ? 'k-ft' : 'k'}</td>
+                  <td className="num">{fmt(ilOptimalCooper.positive.xLead, 2)}</td>
+                  <td>{ilOptimalCooper.positive.direction > 0 ? 'left to right' : 'right to left'}</td>
+                </tr>
+                <tr className="border-b border-slate-200">
+                  <td>{cooper.name}</td>
+                  <td>Minimum (negative)</td>
+                  <td className="num font-semibold text-rose-700">{fmt(ilOptimalCooper.negative.val, 2)} {ilType === 'M' ? 'k-ft' : 'k'}</td>
+                  <td className="num">{fmt(ilOptimalCooper.negative.xLead, 2)}</td>
+                  <td>{ilOptimalCooper.negative.direction > 0 ? 'left to right' : 'right to left'}</td>
+                </tr>
+                {includeAlt && ilOptimalAlt && (
+                  <>
+                    <tr className="border-b border-slate-200">
+                      <td>AREMA Alternate</td>
+                      <td>Maximum positive</td>
+                      <td className="num font-semibold text-blue-700">{fmt(ilOptimalAlt.positive.val, 2)} {ilType === 'M' ? 'k-ft' : 'k'}</td>
+                      <td className="num">{fmt(ilOptimalAlt.positive.xLead, 2)}</td>
+                      <td>{ilOptimalAlt.positive.direction > 0 ? 'left to right' : 'right to left'}</td>
+                    </tr>
+                    <tr className="border-b border-slate-200">
+                      <td>AREMA Alternate</td>
+                      <td>Minimum (negative)</td>
+                      <td className="num font-semibold text-rose-700">{fmt(ilOptimalAlt.negative.val, 2)} {ilType === 'M' ? 'k-ft' : 'k'}</td>
+                      <td className="num">{fmt(ilOptimalAlt.negative.xLead, 2)}</td>
+                      <td>{ilOptimalAlt.negative.direction > 0 ? 'left to right' : 'right to left'}</td>
+                    </tr>
+                  </>
+                )}
+              </tbody>
+            </table>
+            <p className="text-xs text-slate-500 mt-2">
+              The diagram above shows the train loading that produces the larger-magnitude response, in its governing position.
+            </p>
+          </div>
+
+          <details className="mt-5">
+            <summary className="text-sm font-semibold text-slate-700">IL ordinate table (sampled)</summary>
+            <div className="mt-3 overflow-auto max-h-72 border border-slate-200 rounded-md">
+              <table className="results text-sm w-full">
+                <thead className="sticky top-0 bg-slate-100 text-slate-700">
+                  <tr><th>p (ft)</th><th>IL ordinate</th></tr>
+                </thead>
+                <tbody>
+                  {ilSamples.filter((_, i) => i % 4 === 0).map((s, i) => (
+                    <tr key={i} className="border-b border-slate-100">
+                      <td className="num">{fmt(s.p, 2)}</td>
+                      <td className="num">{fmt(s.val, 4)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        </section>
+      )}
+
+      {/* TAB: Design Envelope */}
+      {tab === 'design' && (
+        <section className="bg-white rounded-b-lg rounded-tr-lg shadow-sm border border-slate-200 p-4 sm:p-5">
+          <h2 className="text-base font-semibold text-slate-900 mb-1">Design Envelope (Live Load + Impact)</h2>
+          <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-slate-600 mb-4">
+            <span>
+              Worst case at each section across all included train loadings ({cooper.short}{includeAlt ? ' and AREMA Alternate' : ''}).
+            </span>
+            <span className="px-2 py-0.5 bg-amber-50 border border-amber-300 rounded text-amber-900 font-semibold">
+              Impact factor I = {fmt(impactFactor, 3)} applied
+            </span>
+            {wDL > 0 && (
+              <span className="px-2 py-0.5 bg-slate-100 border border-slate-300 rounded text-slate-800">
+                Dead load (w = {fmt(wDL, 3)} k/ft) shown separately on Dead Load tab
+              </span>
+            )}
+          </div>
+
+          <h3 className="text-sm font-semibold text-slate-700 mt-2 mb-2">Combined Moment Envelope (LL+I)</h3>
+          <EnvelopePlot sections={sections} posSeries={designEnv.combined.Mmax} negSeries={designEnv.combined.Mmin}
+            leftCant={Cl} L={L} rightCant={Cr}
+            ylabel="Moment" posLabel="M+ design" negLabel="M- design" posUnit="k-ft" />
+
+          <h3 className="text-sm font-semibold text-slate-700 mt-6 mb-2">Combined Shear Envelope (LL+I)</h3>
+          <EnvelopePlot sections={sections} posSeries={designEnv.combined.Vmax} negSeries={designEnv.combined.Vmin}
+            leftCant={Cl} L={L} rightCant={Cr}
+            ylabel="Shear" posLabel="V+ design" negLabel="V- design" posUnit="k" />
+
+          <h3 className="text-sm font-semibold text-slate-700 mt-6 mb-2">Peak Design Values (LL+I)</h3>
+          <PeakTable sections={sections} env={designEnv.combined} L={L} leftCant={Cl} rightCant={Cr} srcMap={designEnv.combined} />
+
+          {includeAlt && (
+            <>
+              <h3 className="text-sm font-semibold text-slate-700 mt-6 mb-2">Per-Loading Comparison (LL+I)</h3>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                {designEnv.perConsist.map((item, i) => {
+                  const findPeak = (arr, mode) => {
+                    let idx = 0;
+                    for (let j = 1; j < arr.length; j++) {
+                      if (mode === 'max' && arr[j] > arr[idx]) idx = j;
+                      if (mode === 'min' && arr[j] < arr[idx]) idx = j;
+                    }
+                    return { val: arr[idx], x: sections[idx] };
+                  };
+                  const Mp = findPeak(item.env.Mmax, 'max'), Mn = findPeak(item.env.Mmin, 'min');
+                  const Vp = findPeak(item.env.Vmax, 'max'), Vn = findPeak(item.env.Vmin, 'min');
+                  return (
+                    <div key={i} className="border border-slate-200 rounded-md p-3">
+                      <div className="text-sm font-semibold text-slate-800 mb-2">{item.name}</div>
+                      <table className="results text-sm w-full">
+                        <tbody>
+                          <tr><td className="text-slate-600">M+ peak</td><td className="num text-blue-700">{fmt(Mp.val, 1)} k-ft</td><td className="num text-slate-500">at {fmt(Mp.x, 1)} ft</td></tr>
+                          <tr><td className="text-slate-600">M- peak</td><td className="num text-rose-700">{fmt(Mn.val, 1)} k-ft</td><td className="num text-slate-500">at {fmt(Mn.x, 1)} ft</td></tr>
+                          <tr><td className="text-slate-600">V+ peak</td><td className="num text-blue-700">{fmt(Vp.val, 1)} k</td><td className="num text-slate-500">at {fmt(Vp.x, 1)} ft</td></tr>
+                          <tr><td className="text-slate-600">V- peak</td><td className="num text-rose-700">{fmt(Vn.val, 1)} k</td><td className="num text-slate-500">at {fmt(Vn.x, 1)} ft</td></tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+
+          <details className="mt-5">
+            <summary className="text-sm font-semibold text-slate-700">Full design envelope table (with governing loading)</summary>
+            <div className="mt-3">
+              <FullEnvelopeTable sections={sections} env={designEnv.combined} srcMap={designEnv.combined} />
+            </div>
+          </details>
+        </section>
+      )}
+
+      {/* Footer */}
+      <footer className="text-xs text-slate-500 mt-8 pt-4 border-t border-slate-200">
+        <div className="bg-slate-50 border border-slate-200 rounded-md p-3 mb-3">
+          <div className="text-sm font-semibold text-slate-800 mb-1">Developer Note</div>
+          <p className="text-slate-700">
+            Christopher C. Higgins, School of Civil and Construction Engineering, Oregon State University.
+            Based on the original 2004 Fortran moving load analysis program and adapted for AREMA loading.
+          </p>
+          <p className="text-slate-700 mt-1">
+            Use at own risk. This tool is provided for engineering exploration and educational purposes only;
+            no warranty, express or implied, is made regarding correctness, accuracy, completeness, or fitness for any particular use.
+            Results must be independently verified by a licensed professional engineer before being used for design, evaluation, or construction.
+          </p>
+        </div>
+        <p>
+          Reference: AREMA Manual for Railway Engineering, Chapter 15. Cooper E-XX axle pattern scales linearly with E rating; spacings are independent.
+          AREMA Alternate Live Load is four 100-kip axles with 5'-6'-5' spacings (no uniform).
+        </p>
+        <p className="mt-1">
+          Sign convention: positive M = sagging, positive V = upward force on left side of cut.
+          Shear discontinuity at supports is captured by section-flanking points at +/-0.001 ft on each side of every support; computeShear itself uses a near-zero internal offset so each flanking section evaluates cleanly on its own side of the discontinuity.
+          IL integration of uniform load uses trapezoidal rule with zero-crossing detection.
+          Live-load values are amplified by the impact factor I; default is the AREMA Ch.15 rolling-equipment-without-hammer-blow expression
+          (I = 1 + (40 - 3*L^2/1600)/100 for L &lt; 80 ft, I = 1 + (16 + 600/(L-30))/100 for L &gt;= 80 ft).
+          Dead load is not amplified per AREMA 1.3.5.
+        </p>
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
